@@ -1,206 +1,143 @@
-import os
-import urllib.request
-import threading
-import cv2
-import numpy as np
-import mediapipe as mp
-from config import HAND_FEATURES_DIM, TOTAL_FEATURES_DIM, MODELS_DIR
+"""Features v2: dedos locais, trajetória global, relação entre mãos e corpo."""
 
-HAND_TASK_MODEL_PATH = os.path.join(MODELS_DIR, "hand_landmarker.task")
-HAND_TASK_MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/"
-    "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-)
+import numpy as np
+from config import HAND_FEATURES_DIM, TOTAL_FEATURES_DIM, MAX_FRAME_GAP
+
+
+def hand_shape(coords):
+    centered = coords - coords[0]
+    scale = max(float(np.linalg.norm(centered, axis=1).max()), 1e-6)
+    normalized = centered / scale
+    ratios = [
+        np.clip(
+            np.linalg.norm(normalized[t]) / (np.linalg.norm(normalized[m]) + 1e-5), 0, 3
+        )
+        for t, m in zip((4, 8, 12, 16, 20), (2, 5, 9, 13, 17))
+    ]
+    distances = [np.linalg.norm(normalized[4] - normalized[j]) for j in (8, 6, 12, 16)]
+    return np.r_[1.0, normalized.ravel(), ratios, distances].astype(np.float32), scale
+
+
+def assemble_features(hands, pose, aspect):
+    """hands: dict Left/Right -> 21x3; pose: 5x3 (nariz, boca, ombros), ou None.
+
+    x e z do MediaPipe usam largura como referência. y é convertido para a
+    mesma unidade antes de calcular distâncias. Entrada sempre espelhada.
+    """
+    corrected = {
+        k: np.asarray(v, np.float32) * [1.0, aspect, 1.0] for k, v in hands.items()
+    }
+    body = None if pose is None else np.asarray(pose, np.float32) * [1.0, aspect, 1.0]
+    origin = np.array([0.5, aspect / 2, 0.0], np.float32)
+    scale = 1.0
+    if body is not None:
+        origin = (body[3] + body[4]) / 2
+        scale = max(float(np.linalg.norm((body[3] - body[4])[:2])), 0.1)
+    out = np.zeros(TOTAL_FEATURES_DIM, np.float32)
+    raw_motion = {}
+    for index, label in enumerate(("Left", "Right")):
+        if label not in corrected:
+            continue
+        coords = corrected[label]
+        shape, hand_scale = hand_shape(coords)
+        out[index * HAND_FEATURES_DIM : (index + 1) * HAND_FEATURES_DIM] = shape
+        # Preservado separadamente: mover a mão agora altera as features.
+        out[146 + index * 3 : 149 + index * 3] = (coords[0] - origin) / scale
+        out[171 + index] = hand_scale / scale
+        raw_motion[label] = coords[[0, 4, 8, 12, 16, 20], :2]
+    if len(corrected) == 2:
+        out[152:155] = (corrected["Right"][0] - corrected["Left"][0]) / scale
+    if body is not None:
+        out[155] = 1
+        out[156:171] = ((body - origin) / scale).ravel()
+    return out, raw_motion
 
 
 class HandFeatureExtractor:
     def __init__(self):
-        self.lock = threading.Lock()
-        self.prev_features = None
-        self.use_tasks_api = not hasattr(mp, "solutions")
+        # Importação tardia permite diagnosticar a instalação sem derrubar o site.
+        import mediapipe as mp
 
-        if not self.use_tasks_api:
-            # Compatibilidade com versões antigas do MediaPipe (Legacy Solutions API)
-            self.mp_hands = mp.solutions.hands
-            self.hands = self.mp_hands.Hands(
-                static_image_mode=False,
-                max_num_hands=2,
-                model_complexity=1,
-                min_detection_confidence=0.65,
-                min_tracking_confidence=0.60
+        if not hasattr(mp, "solutions"):
+            raise RuntimeError(
+                "Instale as versões do requirements.txt usando Python 3.11 ou 3.12."
             )
-            print("[INFO] MediaPipe inicializado via API clássica (mp.solutions.hands).")
-        else:
-            # Nova MediaPipe Tasks API (Python 3.12 / 3.13 / MediaPipe 0.10.22+)
-            from mediapipe.tasks import python as mp_python
-            from mediapipe.tasks.python import vision as mp_vision
+        self.hands = mp.solutions.hands.Hands(
+            max_num_hands=2, min_detection_confidence=0.65, min_tracking_confidence=0.6
+        )
+        self.pose = mp.solutions.pose.Pose(
+            model_complexity=1,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.6,
+        )
+        self.previous = None
+        self.last_time = None
 
-            self._ensure_task_model_downloaded()
+    def reset_motion(self):
+        self.previous = None
+        self.last_time = None
 
-            # Lê em bytes (model_asset_buffer) para evitar erro de acentuação no caminho do Windows ("Área de Trabalho")
-            with open(HAND_TASK_MODEL_PATH, "rb") as f:
-                model_bytes = f.read()
+    def reset(self):
+        self.reset_motion()
+        self.hands.reset()
+        self.pose.reset()
 
-            base_options = mp_python.BaseOptions(model_asset_buffer=model_bytes)
-            options = mp_vision.HandLandmarkerOptions(
-                base_options=base_options,
-                running_mode=mp_vision.RunningMode.IMAGE,
-                num_hands=2,
-                min_hand_detection_confidence=0.60,
-                min_hand_presence_confidence=0.60
+    def close(self):
+        self.hands.close()
+        self.pose.close()
+
+    def process_bgr_frame(self, bgr_frame, timestamp):
+        import cv2
+
+        # Convenção do modelo Hands: imagem selfie espelhada, qualquer câmera.
+        rgb = cv2.cvtColor(cv2.flip(bgr_frame, 1), cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        results = self.hands.process(rgb)
+        body_result = self.pose.process(rgb)
+        hands, render = {}, []
+        for lms, handedness in zip(
+            results.multi_hand_landmarks or [], results.multi_handedness or []
+        ):
+            classification = handedness.classification[0]
+            label = classification.label
+            if classification.score < 0.65 or label in hands:
+                continue  # Não inventa lateralidade quando o rastreador está ambíguo.
+            coords = np.array([[p.x, p.y, p.z] for p in lms.landmark], np.float32)
+            hands[label] = coords
+            # Desespelha só para desenhar sobre a imagem original recebida.
+            render.append(
+                {
+                    "handedness": label,
+                    "points": [
+                        {"x": float(1 - p.x), "y": float(p.y), "z": float(p.z)}
+                        for p in lms.landmark
+                    ],
+                }
             )
-            self.detector = mp_vision.HandLandmarker.create_from_options(options)
-            print("[INFO] MediaPipe inicializado via nova Tasks API (HandLandmarker).")
-
-    @staticmethod
-    def _ensure_task_model_downloaded():
-        os.makedirs(MODELS_DIR, exist_ok=True)
-        if not os.path.exists(HAND_TASK_MODEL_PATH):
-            print("[INFO] Baixando modelo oficial 'hand_landmarker.task' (~12 MB) do Google...")
-            urllib.request.urlretrieve(HAND_TASK_MODEL_URL, HAND_TASK_MODEL_PATH)
-            print("[INFO] Download do 'hand_landmarker.task' concluído com sucesso!")
-
-    @staticmethod
-    def _extract_single_hand_features(landmarks) -> np.ndarray:
-        """
-        Extrai 73 features invariantes à translação e escala para uma única mão:
-        - 1 flag de presença (1.0)
-        - 63 coordenadas 3D normalizadas em relação ao pulso (landmark 0)
-        - 5 razões de extensão dos dedos (ponta vs MCP em relação ao pulso)
-        - 4 distâncias críticas do polegar para desambiguação (A/S/E/M/N/T/F)
-        """
-        coords = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float32)
-
-        # Centraliza no pulso (landmark 0)
-        wrist = coords[0].copy()
-        centered = coords - wrist
-
-        # Escala pela distância máxima ao pulso (invariância à distância da câmera)
-        distances = np.linalg.norm(centered, axis=1)
-        max_dist = np.max(distances)
-        if max_dist < 1e-6:
-            max_dist = 1.0
-        normalized = centered / max_dist
-        flat_coords = normalized.flatten()  # 63 valores
-
-        # 5 razões de extensão dos dedos: (dist ponta ao pulso) / (dist MCP ao pulso)
-        tips = [4, 8, 12, 16, 20]
-        mcps = [2, 5, 9, 13, 17]
-        extension_ratios = []
-        for tip_idx, mcp_idx in zip(tips, mcps):
-            d_tip = np.linalg.norm(normalized[tip_idx])
-            d_mcp = np.linalg.norm(normalized[mcp_idx]) + 1e-5
-            extension_ratios.append(np.clip(d_tip / d_mcp, 0.0, 3.0))
-
-        # 4 distâncias entre a ponta do polegar (4) e pontos-chave (8, 6, 12, 16)
-        thumb_tip = normalized[4]
-        key_targets = [8, 6, 12, 16]
-        thumb_distances = [
-            float(np.linalg.norm(thumb_tip - normalized[idx]))
-            for idx in key_targets
-        ]
-
-        features = np.concatenate([
-            np.array([1.0], dtype=np.float32),
-            flat_coords,
-            np.array(extension_ratios, dtype=np.float32),
-            np.array(thumb_distances, dtype=np.float32)
-        ])
-        return features  # Dimensão: 73
-
-    def process_bgr_frame(self, bgr_frame: np.ndarray) -> dict:
-        """
-        Processa um frame BGR do OpenCV e retorna:
-        - features: np.ndarray de 146 posições (Left 73 + Right 73)
-        - hands_detected: int
-        - velocity: float (velocidade média dos pontos entre frames)
-        - landmarks: lista serializável para desenhar no canvas do frontend
-        """
-        rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-        rgb_frame = np.ascontiguousarray(rgb_frame)
-
-        left_slot = np.zeros(HAND_FEATURES_DIM, dtype=np.float32)
-        right_slot = np.zeros(HAND_FEATURES_DIM, dtype=np.float32)
-        landmarks_render = []
-        hands_detected = 0
-
-        with self.lock:
-            if not self.use_tasks_api:
-                rgb_frame.flags.writeable = False
-                results = self.hands.process(rgb_frame)
-                if results.multi_hand_landmarks and results.multi_handedness:
-                    for hand_lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-                        hands_detected += 1
-                        label = handedness.classification[0].label
-                        score = float(handedness.classification[0].score)
-                        lm_list = hand_lms.landmark
-
-                        single_feat = self._extract_single_hand_features(lm_list)
-                        if label == "Left" and left_slot[0] == 0.0:
-                            left_slot = single_feat
-                        elif label == "Right" and right_slot[0] == 0.0:
-                            right_slot = single_feat
-                        elif left_slot[0] == 0.0:
-                            left_slot = single_feat
-                        else:
-                            right_slot = single_feat
-
-                        landmarks_render.append({
-                            "handedness": label,
-                            "score": round(score, 3),
-                            "points": [
-                                {"x": round(lm.x, 4), "y": round(lm.y, 4), "z": round(lm.z, 4)}
-                                for lm in lm_list
-                            ]
-                        })
-            else:
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-                detection_result = self.detector.detect(mp_image)
-
-                if detection_result.hand_landmarks and detection_result.handedness:
-                    for lm_list, handedness_list in zip(detection_result.hand_landmarks, detection_result.handedness):
-                        hands_detected += 1
-                        top_hand = handedness_list[0]
-                        label = getattr(top_hand, "category_name", None) or getattr(top_hand, "display_name", "Right")
-                        score = float(getattr(top_hand, "score", 1.0))
-
-                        single_feat = self._extract_single_hand_features(lm_list)
-                        if label == "Left" and left_slot[0] == 0.0:
-                            left_slot = single_feat
-                        elif label == "Right" and right_slot[0] == 0.0:
-                            right_slot = single_feat
-                        elif left_slot[0] == 0.0:
-                            left_slot = single_feat
-                        else:
-                            right_slot = single_feat
-
-                        landmarks_render.append({
-                            "handedness": label,
-                            "score": round(score, 3),
-                            "points": [
-                                {"x": round(lm.x, 4), "y": round(lm.y, 4), "z": round(lm.z, 4)}
-                                for lm in lm_list
-                            ]
-                        })
-
-        full_features = np.concatenate([left_slot, right_slot])
-        assert full_features.shape[0] == TOTAL_FEATURES_DIM
-
-        # Cálculo de velocidade de movimento entre frames consecutivos
+        pose = None
+        if body_result.pose_landmarks:
+            pts = [body_result.pose_landmarks.landmark[i] for i in (0, 9, 10, 11, 12)]
+            if min(p.visibility for p in pts) >= 0.6:
+                pose = np.array([[p.x, p.y, p.z] for p in pts], np.float32)
+        features, motion = assemble_features(
+            hands, pose, bgr_frame.shape[0] / bgr_frame.shape[1]
+        )
         velocity = 0.0
-        if hands_detected > 0 and self.prev_features is not None:
-            active_mask = (full_features[0] > 0 and self.prev_features[0] > 0) or (
-                full_features[HAND_FEATURES_DIM] > 0 and self.prev_features[HAND_FEATURES_DIM] > 0
-            )
-            if active_mask:
-                diff = np.abs(full_features - self.prev_features)
-                velocity = float(np.mean(diff))
-
-        self.prev_features = full_features.copy() if hands_detected > 0 else None
-
+        dt = timestamp - self.last_time if self.last_time is not None else None
+        if self.previous is not None and dt is not None and 0 < dt <= MAX_FRAME_GAP:
+            speeds = [
+                np.mean(np.linalg.norm(p - self.previous[k], axis=1)) / dt
+                for k, p in motion.items()
+                if k in self.previous
+            ]
+            if speeds:
+                velocity = float(np.mean(speeds))
+        self.previous, self.last_time = motion, timestamp
         return {
-            "features": full_features,
-            "hands_detected": hands_detected,
+            "features": features,
             "velocity": velocity,
-            "landmarks": landmarks_render
+            "hands_detected": len(hands),
+            "body_detected": pose is not None,
+            "landmarks": render,
+            "tracking_signature": tuple(sorted(hands)),
         }
