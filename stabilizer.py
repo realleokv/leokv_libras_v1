@@ -1,118 +1,157 @@
-import time
-from collections import deque, Counter
+"""Decisões temporais por conexão e emissão por execução do gesto."""
+
+from collections import deque
 import numpy as np
-from config import SEQ_LENGTH, DEFAULT_CONFIDENCE_THRESHOLD, MOTION_VELOCITY_THRESHOLD
+from config import (
+    STATIC_THRESHOLD,
+    DYNAMIC_THRESHOLD,
+    MIN_MARGIN,
+    BACKGROUND_LABEL,
+    MOTION_VELOCITY_THRESHOLD,
+    MAX_FRAME_GAP,
+    SEQUENCE_SECONDS,
+)
+from temporal import resample_sequence
+
+
+def result(
+    status, label="Sinal não reconhecido", score=0.0, dynamic=False, emitted=None
+):
+    return {
+        "status": status,
+        "display_label": label,
+        "score": round(score * 100, 1),
+        "is_dynamic": dynamic,
+        "emitted": emitted,
+    }
 
 
 class TemporalStabilizer:
     def __init__(self):
-        self.static_window = deque(maxlen=8)
-        self.sequence_buffer = deque(maxlen=SEQ_LENGTH)
-        self.motion_history = deque(maxlen=SEQ_LENGTH)
-
-        self.confidence_threshold = DEFAULT_CONFIDENCE_THRESHOLD
-        self.last_emitted_label = None
-        self.last_emitted_time = 0.0
-        self.repeat_cooldown = 2.0  # Segundos antes de aceitar a repetição do mesmo sinal
+        self.thresholds = {"static": STATIC_THRESHOLD, "dynamic": DYNAMIC_THRESHOLD}
+        self.reset()
 
     def reset(self):
-        self.static_window.clear()
-        self.sequence_buffer.clear()
-        self.motion_history.clear()
-        self.last_emitted_label = None
+        self.frames = deque(maxlen=80)
+        self.static_votes = deque()
+        self.last_timestamp = None
+        self.signature = None
+        self.emitted_label = None
+        self.neutral_since = None
+        self.last_dynamic_check = -100.0
+        self.dynamic_candidate = None
+        self.dynamic_votes = 0
 
-    def process_step(
-        self,
-        features: np.ndarray,
-        hands_detected: int,
-        velocity: float,
-        ml_engine
-    ) -> dict:
-        if hands_detected == 0:
-            self.static_window.clear()
-            self.sequence_buffer.clear()
-            self.motion_history.clear()
-            self.last_emitted_label = None
-            return {
-                "status": "no_hands",
-                "display_label": "Aguardando mãos...",
-                "confidence": 0.0,
-                "is_dynamic": False,
-                "emitted": None
-            }
+    def _neutral(self, timestamp):
+        if self.neutral_since is None:
+            self.neutral_since = timestamp
+        if timestamp - self.neutral_since >= 0.4:
+            self.emitted_label = None
 
-        has_static = ml_engine.static_model is not None
-        has_dynamic = ml_engine.dynamic_model is not None
-
-        if not has_static and not has_dynamic:
-            return {
-                "status": "untrained",
-                "display_label": "Modelo não treinado",
-                "confidence": 0.0,
-                "is_dynamic": False,
-                "emitted": None
-            }
-
-        self.sequence_buffer.append(features)
-        self.motion_history.append(velocity)
-        avg_recent_velocity = float(np.mean(list(self.motion_history)[-6:]))
-
-        best_label = None
-        best_conf = 0.0
-        is_dynamic_pred = False
-
-        # 1. Se houver movimento relevante e o buffer de sequência estiver cheio, avalia LSTM
-        if has_dynamic and len(self.sequence_buffer) == SEQ_LENGTH and avg_recent_velocity >= MOTION_VELOCITY_THRESHOLD:
-            seq_arr = np.array(self.sequence_buffer, dtype=np.float32)
-            dyn_label, dyn_conf = ml_engine.predict_dynamic(seq_arr)
-            if dyn_label and dyn_conf >= self.confidence_threshold:
-                best_label = dyn_label
-                best_conf = dyn_conf
-                is_dynamic_pred = True
-
-        # 2. Se a mão estiver estável (baixa velocidade) e não acionou dinâmico, avalia Random Forest Estático
-        if best_label is None and has_static and avg_recent_velocity < (MOTION_VELOCITY_THRESHOLD * 1.4):
-            stat_label, stat_conf = ml_engine.predict_static(features)
-            if stat_label and stat_conf >= self.confidence_threshold:
-                self.static_window.append((stat_label, stat_conf))
+    def process_step(self, extracted, timestamp, engine, signs):
+        x, velocity = extracted["features"], extracted["velocity"]
+        signature = extracted.get("tracking_signature")
+        if (
+            self.last_timestamp is not None
+            and timestamp - self.last_timestamp > MAX_FRAME_GAP
+        ):
+            self.reset()
+        self.last_timestamp = timestamp
+        if not extracted["hands_detected"]:
+            self.frames.clear()
+            self.static_votes.clear()
+            self.dynamic_candidate, self.dynamic_votes = None, 0
+            self._neutral(timestamp)
+            return result("no_hands", "Aguardando mãos")
+        if self.signature != signature:
+            self.frames.clear()
+            self.static_votes.clear()
+            self.dynamic_candidate, self.dynamic_votes = None, 0
+        self.signature = signature
+        if not engine.available("static") and not engine.available("dynamic"):
+            return result("untrained", "Faça a coleta e treine um modelo v2")
+        self.frames.append((timestamp, x.copy(), velocity))
+        while (
+            len(self.frames) > 1
+            and timestamp - self.frames[0][0] > SEQUENCE_SECONDS + 0.2
+        ):
+            self.frames.popleft()
+        if velocity >= MOTION_VELOCITY_THRESHOLD:
+            self.static_votes.clear()
+        candidate, score, dynamic = None, 0.0, False
+        # Movimento em qualquer parte da janela, inclusive se o gesto terminou parado.
+        if (
+            engine.available("dynamic")
+            and len(self.frames) >= 6
+            and timestamp - self.frames[0][0] >= SEQUENCE_SECONDS - 0.25
+            and any(f[2] >= MOTION_VELOCITY_THRESHOLD for f in self.frames)
+            and timestamp - self.last_dynamic_check >= 0.15
+        ):
+            self.last_dynamic_check = timestamp
+            try:
+                sequence = resample_sequence(
+                    [f[1] for f in self.frames], [f[0] for f in self.frames]
+                )
+                label, score, margin = engine.predict("dynamic", sequence)
+                if label == BACKGROUND_LABEL:
+                    self._neutral(timestamp)
+                if (
+                    label
+                    and label != BACKGROUND_LABEL
+                    and score >= self.thresholds["dynamic"]
+                    and margin >= MIN_MARGIN
+                ):
+                    self.dynamic_votes = (
+                        self.dynamic_votes + 1 if label == self.dynamic_candidate else 1
+                    )
+                    self.dynamic_candidate = label
+                    if self.dynamic_votes >= 2:
+                        candidate, dynamic = label, True
+                else:
+                    self.dynamic_candidate, self.dynamic_votes = None, 0
+            except ValueError:
+                self.dynamic_candidate, self.dynamic_votes = None, 0
+        if (
+            candidate is None
+            and engine.available("static")
+            and velocity < MOTION_VELOCITY_THRESHOLD
+        ):
+            label, static_score, margin = engine.predict("static", x)
+            score = max(score, static_score)
+            if label == BACKGROUND_LABEL:
+                self.static_votes.clear()
+                self._neutral(timestamp)
+                return result("neutral", "Nenhum sinal", static_score)
+            if (
+                label
+                and static_score >= self.thresholds["static"]
+                and margin >= MIN_MARGIN
+            ):
+                self.static_votes.append((timestamp, label, static_score))
+                while self.static_votes and timestamp - self.static_votes[0][0] > 0.8:
+                    self.static_votes.popleft()
+                same = [v for v in self.static_votes if v[1] == label]
+                if (
+                    len(same) >= 4
+                    and timestamp - same[0][0] >= 0.35
+                    and len(same) == len(self.static_votes)
+                ):
+                    candidate, score = label, float(np.mean([v[2] for v in same]))
             else:
-                self.static_window.append(("__LOW__", stat_conf))
-
-            if len(self.static_window) >= 5:
-                labels_in_win = [item[0] for item in self.static_window if item[0] != "__LOW__"]
-                if labels_in_win:
-                    most_common_lbl, count = Counter(labels_in_win).most_common(1)[0]
-                    if count >= 4:
-                        confs = [item[1] for item in self.static_window if item[0] == most_common_lbl]
-                        best_label = most_common_lbl
-                        best_conf = float(np.mean(confs))
-                        is_dynamic_pred = False
-
-        # 3. Se não atingiu confiança suficiente ou estabilidade
-        if best_label is None:
-            return {
-                "status": "low_confidence",
-                "display_label": "Sinal não reconhecido",
-                "confidence": round(best_conf * 100, 1),
-                "is_dynamic": False,
-                "emitted": None
-            }
-
-        # 4. Controle Anti-Repetição para emissão na caixa de texto
-        now = time.time()
-        emitted_token = None
-        if best_label != self.last_emitted_label or (now - self.last_emitted_time) > self.repeat_cooldown:
-            emitted_token = best_label
-            self.last_emitted_label = best_label
-            self.last_emitted_time = now
-            if is_dynamic_pred:
-                self.sequence_buffer.clear()
-                self.static_window.clear()
-
-        return {
-            "status": "recognized",
-            "display_label": best_label,
-            "confidence": round(best_conf * 100, 1),
-            "is_dynamic": is_dynamic_pred,
-            "emitted": emitted_token
-        }
+                self.static_votes.clear()
+        if candidate is None:
+            return result("uncertain", score=score)
+        sign = signs.get(candidate.casefold())
+        if sign is None or (sign["two_hands"] and extracted["hands_detected"] != 2):
+            return result("requirements", "Mostre as duas mãos", score)
+        if sign["requires_body"] and not extracted["body_detected"]:
+            return result("requirements", "Enquadre rosto e ombros", score)
+        self.neutral_since = None
+        emitted = candidate if candidate != self.emitted_label else None
+        if emitted:
+            self.emitted_label = candidate
+            if dynamic:
+                self.frames.clear()
+                self.static_votes.clear()
+                self.dynamic_candidate, self.dynamic_votes = None, 0
+        return result("recognized", candidate, score, dynamic, emitted)

@@ -1,0 +1,6 @@
+{
+  "videos": [
+    {"file": "pessoa_fora_do_treino.mp4", "events": [{"label": "A", "start": 1.0, "end": 2.0}, {"label": "J", "start": 4.0, "end": 6.0}]},
+    {"file": "movimentos_sem_sinais.mp4", "events": []}
+  ]
+}

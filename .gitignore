@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dados privados e modelos gerados localmente
+/data/
+*.pem
+*.key
+/exports/
+/reports/

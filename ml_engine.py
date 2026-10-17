@@ -1,300 +1,355 @@
+"""Treino agrupado por pessoa, calibração separada e publicação atômica."""
+
+import hashlib
+import json
 import os
-import joblib
+import threading
+import uuid
+from pathlib import Path
+
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
+from scipy.optimize import minimize_scalar
+from scipy.special import softmax
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-from config import (
-    STATIC_DATA_PATH,
-    DYNAMIC_DATA_PATH,
-    STATIC_MODEL_PATH,
-    DYNAMIC_MODEL_PATH,
-    TOTAL_FEATURES_DIM,
-    SEQ_LENGTH
-)
-from database import sync_sample_counts, update_training_metrics
+from config import FEATURE_VERSION, TOTAL_FEATURES_DIM, BACKGROUND_LABEL, MIN_MARGIN
+from database import utc_now
+from temporal import resample_sequence
 
 
-class LibrasLSTM(nn.Module):
-    """Rede Neural Recorrente LSTM para sinais dinâmicos de Libras."""
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, num_classes: int):
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=0.2 if num_layers > 1 else 0.0
+def atomic_json(path, value):
+    path = Path(path)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+def grouped_partitions(records):
+    """Nenhuma pessoa, sessão ou gravação atravessa treino, calibração e teste."""
+    labels = np.array([r["display_label"] for r in records])
+    people = np.array([r["signer"] for r in records])
+    classes = set(labels)
+    if len(classes) < 3 or BACKGROUND_LABEL not in classes:
+        raise ValueError(
+            "Colete pelo menos dois sinais e a classe Nenhum sinal neste modo."
         )
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, num_classes)
+    unique_people = np.unique(people)
+    for label in sorted(classes):
+        mask = labels == label
+        if mask.sum() < 6 or len(set(people[mask])) < 3:
+            raise ValueError(
+                f"{label}: são necessárias 6 gravações reais de pelo menos 3 pessoas."
+            )
+    rng = np.random.default_rng(42)
+    size = max(1, round(len(unique_people) * 0.2))
+    for _ in range(512):
+        perm = rng.permutation(unique_people)
+        groups = (perm[2 * size :], perm[:size], perm[size : 2 * size])
+        parts = [np.flatnonzero(np.isin(people, g)) for g in groups]
+        if all(set(labels[p]) == classes for p in parts):
+            return parts
+    raise ValueError(
+        "Não há cobertura de todas as classes nos três grupos. Grave todos os sinais com as mesmas 3 ou mais pessoas."
+    )
+
+
+def fit_temperature(logits, targets):
+    def loss(temp):
+        p = softmax(logits / temp, axis=1)
+        return float(
+            -np.log(np.clip(p[np.arange(len(targets)), targets], 1e-9, 1)).mean()
         )
 
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        last_step = out[:, -1, :]
-        logits = self.fc(last_step)
-        return logits
+    return float(minimize_scalar(loss, bounds=(0.5, 5.0), method="bounded").x)
+
+
+def make_lstm(classes):
+    import torch.nn as nn
+
+    class LibrasLSTM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lstm = nn.LSTM(TOTAL_FEATURES_DIM, 64, batch_first=True)
+            self.fc = nn.Linear(64, classes)
+
+        def forward(self, x):
+            out, _ = self.lstm(x)
+            return self.fc(out[:, -1])
+
+    return LibrasLSTM()
 
 
 class LibrasMLEngine:
-    def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.static_model = None
-        self.static_classes = []
-
-        self.dynamic_model = None
-        self.dynamic_classes = []
-
+    def __init__(self, database, model_dir):
+        self.db, self.directory = database, Path(model_dir)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.models = {}
+        self.errors = {}
         self.load_models()
-        self.refresh_database_counts()
 
-    # -------------------- Gerenciamento de Amostras -------------------- #
-    @staticmethod
-    def _load_npz(path: str, empty_shape: tuple):
-        if os.path.exists(path):
-            data = np.load(path, allow_pickle=True)
-            return data["X"], data["y"]
-        return np.empty(empty_shape, dtype=np.float32), np.empty((0,), dtype=str)
-
-    def add_static_samples(self, features_list: list, label: str) -> int:
-        X_new = np.array(features_list, dtype=np.float32)
-        y_new = np.array([label] * len(features_list), dtype=str)
-
-        X_old, y_old = self._load_npz(STATIC_DATA_PATH, (0, TOTAL_FEATURES_DIM))
-        X_all = np.vstack([X_old, X_new]) if len(X_old) > 0 else X_new
-        y_all = np.concatenate([y_old, y_new]) if len(y_old) > 0 else y_new
-
-        np.savez_compressed(STATIC_DATA_PATH, X=X_all, y=y_all)
-        self.refresh_database_counts()
-        return int(np.sum(y_all == label))
-
-    def add_dynamic_sequence(self, sequence: np.ndarray, label: str) -> int:
-        seq_arr = np.expand_dims(np.array(sequence, dtype=np.float32), axis=0)  # (1, SEQ_LENGTH, 146)
-        y_new = np.array([label], dtype=str)
-
-        X_old, y_old = self._load_npz(DYNAMIC_DATA_PATH, (0, SEQ_LENGTH, TOTAL_FEATURES_DIM))
-        X_all = np.vstack([X_old, seq_arr]) if len(X_old) > 0 else seq_arr
-        y_all = np.concatenate([y_old, y_new]) if len(y_old) > 0 else y_new
-
-        np.savez_compressed(DYNAMIC_DATA_PATH, X=X_all, y=y_all)
-        self.refresh_database_counts()
-        return int(np.sum(y_all == label))
-
-    def delete_samples_for_label(self, label: str):
-        # Remove de estáticos
-        X_s, y_s = self._load_npz(STATIC_DATA_PATH, (0, TOTAL_FEATURES_DIM))
-        if len(y_s) > 0:
-            mask = y_s != label
-            np.savez_compressed(STATIC_DATA_PATH, X=X_s[mask], y=y_s[mask])
-
-        # Remove de dinâmicos
-        X_d, y_d = self._load_npz(DYNAMIC_DATA_PATH, (0, SEQ_LENGTH, TOTAL_FEATURES_DIM))
-        if len(y_d) > 0:
-            mask = y_d != label
-            np.savez_compressed(DYNAMIC_DATA_PATH, X=X_d[mask], y=y_d[mask])
-
-        self.refresh_database_counts()
-
-    def refresh_database_counts(self):
-        counts = {}
-        _, y_s = self._load_npz(STATIC_DATA_PATH, (0, TOTAL_FEATURES_DIM))
-        _, y_d = self._load_npz(DYNAMIC_DATA_PATH, (0, SEQ_LENGTH, TOTAL_FEATURES_DIM))
-
-        for lbl in y_s:
-            counts[str(lbl)] = counts.get(str(lbl), 0) + 1
-        for lbl in y_d:
-            counts[str(lbl)] = counts.get(str(lbl), 0) + 1
-
-        sync_sample_counts(counts)
-
-    # -------------------- Carregamento de Modelos -------------------- #
     def load_models(self):
-        if os.path.exists(STATIC_MODEL_PATH):
-            try:
-                bundle = joblib.load(STATIC_MODEL_PATH)
-                self.static_model = bundle["model"]
-                self.static_classes = list(bundle["classes"])
-            except Exception as e:
-                print(f"[AVISO] Falha ao carregar modelo estático: {e}")
+        registry = self.directory / "registry.json"
+        if not registry.exists():
+            return
+        try:
+            entries = json.loads(registry.read_text(encoding="utf-8"))
+            for kind, folder in entries.items():
+                if (
+                    kind not in ("static", "dynamic")
+                    or len(folder) != 32
+                    or any(c not in "0123456789abcdef" for c in folder)
+                ):
+                    raise ValueError("Registro de modelos inválido.")
+                try:
+                    root = self.directory / folder
+                    meta = json.loads(
+                        (root / "metadata.json").read_text(encoding="utf-8")
+                    )
+                    if (
+                        meta["feature_version"] != FEATURE_VERSION
+                        or meta["features_dim"] != TOTAL_FEATURES_DIM
+                    ):
+                        raise ValueError(
+                            "Modelo de outra versão de features. Faça nova coleta e treinamento."
+                        )
+                    if meta["revision"] != self.db.revision(kind):
+                        raise ValueError(
+                            "Amostras alteradas desde o treinamento. Treine novamente."
+                        )
+                    model_path = root / (
+                        "model.skops" if kind == "static" else "model.pt"
+                    )
+                    if (
+                        hashlib.sha256(model_path.read_bytes()).hexdigest()
+                        != meta["sha256"]
+                    ):
+                        raise ValueError("Arquivo de modelo danificado.")
+                    if kind == "static":
+                        import skops.io as sio
 
-        if os.path.exists(DYNAMIC_MODEL_PATH):
-            try:
-                checkpoint = torch.load(DYNAMIC_MODEL_PATH, map_location=self.device, weights_only=False)
-                classes = checkpoint["classes"]
-                model = LibrasLSTM(
-                    input_size=TOTAL_FEATURES_DIM,
-                    hidden_size=128,
-                    num_layers=2,
-                    num_classes=len(classes)
-                ).to(self.device)
-                model.load_state_dict(checkpoint["state_dict"])
-                model.eval()
-                self.dynamic_model = model
-                self.dynamic_classes = list(classes)
-            except Exception as e:
-                print(f"[AVISO] Falha ao carregar modelo dinâmico: {e}")
+                        # Não aceita tipos arbitrários trazidos por arquivos externos.
+                        model = sio.load(model_path, trusted=[])
+                    else:
+                        import torch
 
-    # -------------------- Treinamento Estático (Scikit-Learn) -------------------- #
-    def train_static_model(self) -> dict:
-        X, y = self._load_npz(STATIC_DATA_PATH, (0, TOTAL_FEATURES_DIM))
-        unique_classes, counts = np.unique(y, return_counts=True)
+                        model = make_lstm(len(meta["classes"]))
+                        model.load_state_dict(
+                            torch.load(
+                                model_path, map_location="cpu", weights_only=True
+                            )
+                        )
+                        model.eval()
+                    self.models[kind] = (model, meta)
+                except Exception as e:
+                    self.errors[kind] = str(e)
+        except Exception as e:
+            self.errors["registry"] = str(e)
 
-        if len(unique_classes) < 2:
-            return {
-                "trained": False,
-                "message": "São necessárias amostras de pelo menos 2 sinais estáticos diferentes para treinar o classificador Scikit-learn."
-            }
+    def invalidate(self, kind):
+        with self.lock:
+            self.models.pop(kind, None)
+            self.errors[kind] = (
+                "Dados alterados. Modelo desativado até novo treinamento."
+            )
 
-        if np.min(counts) < 4:
-            return {
-                "trained": False,
-                "message": f"Cada sinal estático precisa de pelo menos 4 amostras (mínimo atual: {int(np.min(counts))})."
-            }
+    def status(self):
+        summaries = self.db.summaries()
+        result = {}
+        with self.lock:
+            for kind in ("static", "dynamic"):
+                loaded = self.models.get(kind)
+                metadata = loaded[1] if loaded else summaries.get(kind, {})
+                ready = loaded is not None and metadata.get(
+                    "revision"
+                ) == self.db.revision(kind)
+                result[kind] = {
+                    "ready": ready,
+                    "state": "pronto" if ready else "não disponível",
+                    "error": self.errors.get(kind),
+                    "classes": metadata.get("classes", []) if ready else [],
+                    "metrics": metadata if ready else None,
+                }
+            result["errors"] = self.errors.copy()
+        return result
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.25, random_state=42, stratify=y
+    def train(self, kind, progress, epochs=35):
+        if kind not in ("static", "dynamic"):
+            raise ValueError("Tipo de modelo inválido.")
+        records = self.db.recordings(kind)
+        train, calibration, test = grouped_partitions(records)
+        classes = sorted({r["display_label"] for r in records})
+        label_idx = {label: i for i, label in enumerate(classes)}
+        y = np.array([label_idx[r["display_label"]] for r in records])
+        revision = self.db.revision(kind)
+        progress(f"{kind}: treinando com pessoas separadas")
+        extras = {}
+        if kind == "static":
+            # Limita o peso de cada gravação; todas as partições são definidas antes dos frames.
+            frames = [
+                r["features"][
+                    np.linspace(
+                        0, len(r["features"]) - 1, min(30, len(r["features"]))
+                    ).astype(int)
+                ]
+                for r in records
+            ]
+            model = RandomForestClassifier(
+                n_estimators=160,
+                max_depth=18,
+                class_weight="balanced",
+                random_state=42,
+                n_jobs=2,
+            )
+            model.fit(
+                np.concatenate([frames[i] for i in train]),
+                np.concatenate([np.repeat(y[i], len(frames[i])) for i in train]),
+            )
+
+            def logits_for(indices):
+                probabilities = np.stack(
+                    [model.predict_proba(frames[i]).mean(axis=0) for i in indices]
+                )
+                return np.log(np.clip(probabilities, 1e-7, 1))
+
+        else:
+            import torch
+
+            torch.manual_seed(42)
+            torch.set_num_threads(2)
+            sequences = np.stack(
+                [resample_sequence(r["features"], r["timestamps"]) for r in records]
+            )
+            mean = sequences[train].mean(axis=(0, 1))
+            scale = np.maximum(sequences[train].std(axis=(0, 1)), 0.05)
+            normalized = (sequences - mean) / scale
+            extras = {"mean": mean.tolist(), "scale": scale.tolist()}
+            model = make_lstm(len(classes))
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+            weights = len(train) / (
+                len(classes) * np.bincount(y[train], minlength=len(classes))
+            )
+            loss_fn = torch.nn.CrossEntropyLoss(
+                weight=torch.tensor(weights, dtype=torch.float32)
+            )
+            gen = np.random.default_rng(42)
+            model.train()
+            for epoch in range(epochs):
+                order = gen.permutation(train)
+                for start in range(0, len(order), 16):
+                    idx = order[start : start + 16]
+                    optimizer.zero_grad()
+                    loss = loss_fn(
+                        model(torch.tensor(normalized[idx])),
+                        torch.tensor(y[idx], dtype=torch.long),
+                    )
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                progress(f"Dinâmico: época {epoch+1}/{epochs}")
+            model.eval()
+
+            def logits_for(indices):
+                with torch.no_grad():
+                    return model(
+                        torch.tensor(normalized[indices], dtype=torch.float32)
+                    ).numpy()
+
+        temperature = fit_temperature(logits_for(calibration), y[calibration])
+        probs = softmax(logits_for(test) / temperature, axis=1)
+        preds = probs.argmax(axis=1)
+        report = classification_report(
+            y[test],
+            preds,
+            labels=list(range(len(classes))),
+            target_names=classes,
+            output_dict=True,
+            zero_division=0,
         )
-
-        clf = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=20,
-            class_weight="balanced",
-            random_state=42,
-            n_jobs=-1
-        )
-        clf.fit(X_train, y_train)
-
-        y_pred = clf.predict(X_test)
-        acc = float(accuracy_score(y_test, y_pred))
-        report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
-
-        # Treina com 100% dos dados após avaliar na partição de teste para máxima performance em produção
-        clf.fit(X, y)
-        joblib.dump({"model": clf, "classes": list(clf.classes_)}, STATIC_MODEL_PATH)
-
-        self.static_model = clf
-        self.static_classes = list(clf.classes_)
-
-        class_metrics = {
-            cls: report[cls]
-            for cls in unique_classes
-            if cls in report
-        }
-        update_training_metrics("static_rf", acc, len(y), class_metrics)
-
-        return {
-            "trained": True,
-            "accuracy": round(acc * 100, 2),
-            "classes": list(unique_classes),
-            "total_samples": len(y),
-            "message": f"Modelo estático (Random Forest) treinado com {len(unique_classes)} classes e {round(acc*100, 1)}% de acurácia real em validação."
-        }
-
-    # -------------------- Treinamento Dinâmico (PyTorch LSTM) -------------------- #
-    def train_dynamic_model(self, epochs: int = 45) -> dict:
-        X, y = self._load_npz(DYNAMIC_DATA_PATH, (0, SEQ_LENGTH, TOTAL_FEATURES_DIM))
-        unique_classes, counts = np.unique(y, return_counts=True)
-
-        if len(unique_classes) < 2:
-            return {
-                "trained": False,
-                "message": "São necessárias sequências de pelo menos 2 sinais dinâmicos diferentes para treinar a LSTM."
-            }
-
-        if np.min(counts) < 3:
-            return {
-                "trained": False,
-                "message": f"Cada sinal dinâmico precisa de pelo menos 3 sequências gravadas (mínimo atual: {int(np.min(counts))})."
-            }
-
-        classes = sorted(list(unique_classes))
-        label_to_idx = {c: i for i, c in enumerate(classes)}
-        y_idx = np.array([label_to_idx[lbl] for lbl in y], dtype=np.int64)
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y_idx, test_size=0.25, random_state=42, stratify=y_idx
-        )
-
-        train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
-        train_loader = DataLoader(train_ds, batch_size=min(16, len(train_ds)), shuffle=True)
-
-        model = LibrasLSTM(
-            input_size=TOTAL_FEATURES_DIM,
-            hidden_size=128,
-            num_layers=2,
-            num_classes=len(classes)
-        ).to(self.device)
-
-        criterion = nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
-
-        model.train()
-        for _ in range(epochs):
-            for batch_x, batch_y in train_loader:
-                batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
-                optimizer.zero_grad()
-                logits = model(batch_x)
-                loss = criterion(logits, batch_y)
-                loss.backward()
-                optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            test_x = torch.tensor(X_test, dtype=torch.float32).to(self.device)
-            logits = model(test_x)
-            preds = torch.argmax(logits, dim=1).cpu().numpy()
-
-        y_test_labels = [classes[i] for i in y_test]
-        y_pred_labels = [classes[i] for i in preds]
-
-        acc = float(accuracy_score(y_test_labels, y_pred_labels))
-        report = classification_report(y_test_labels, y_pred_labels, output_dict=True, zero_division=0)
-
-        torch.save({
-            "state_dict": model.state_dict(),
-            "classes": classes
-        }, DYNAMIC_MODEL_PATH)
-
-        self.dynamic_model = model
-        self.dynamic_classes = classes
-
-        class_metrics = {
-            cls: report[cls]
-            for cls in classes
-            if cls in report
-        }
-        update_training_metrics("dynamic_lstm", acc, len(y), class_metrics)
-
-        return {
-            "trained": True,
-            "accuracy": round(acc * 100, 2),
+        meta = {
+            "kind": kind,
+            "feature_version": FEATURE_VERSION,
+            "features_dim": TOTAL_FEATURES_DIM,
+            "revision": revision,
             "classes": classes,
-            "total_samples": len(y),
-            "message": f"Modelo temporal (PyTorch LSTM) treinado com {len(classes)} classes e {round(acc*100, 1)}% de acurácia real em validação."
+            "temperature": temperature,
+            "accuracy": float(accuracy_score(y[test], preds)),
+            "report": report,
+            "confusion_matrix": confusion_matrix(
+                y[test], preds, labels=list(range(len(classes)))
+            ).tolist(),
+            "recordings": len(records),
+            "test_recordings": len(test),
+            "people": len({r["signer"] for r in records}),
+            "split_people_counts": [
+                len({records[i]["signer"] for i in p})
+                for p in (train, calibration, test)
+            ],
+            "evaluation": "Gravações reais separadas por pessoa; não é avaliação de tradução contínua.",
+            "updated_at": utc_now(),
+            **extras,
         }
+        # Não retreina no conjunto de teste depois de medir o desempenho.
+        folder = uuid.uuid4().hex
+        root = self.directory / folder
+        root.mkdir()
+        path = root / ("model.skops" if kind == "static" else "model.pt")
+        if kind == "static":
+            import skops.io as sio
 
-    # -------------------- Inferência em Tempo Real -------------------- #
-    def predict_static(self, features: np.ndarray) -> tuple:
-        if self.static_model is None or len(self.static_classes) == 0:
-            return None, 0.0
-        probs = self.static_model.predict_proba(features.reshape(1, -1))[0]
-        best_idx = int(np.argmax(probs))
-        return str(self.static_model.classes_[best_idx]), float(probs[best_idx])
+            sio.dump(model, path)
+        else:
+            import torch
 
-    def predict_dynamic(self, sequence: np.ndarray) -> tuple:
-        if self.dynamic_model is None or len(self.dynamic_classes) == 0:
-            return None, 0.0
-        with torch.no_grad():
-            tensor_seq = torch.tensor(sequence, dtype=torch.float32).unsqueeze(0).to(self.device)
-            logits = self.dynamic_model(tensor_seq)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-            best_idx = int(np.argmax(probs))
-            return str(self.dynamic_classes[best_idx]), float(probs[best_idx])
+            torch.save(model.state_dict(), path)
+        meta["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        atomic_json(root / "metadata.json", meta)
+        if revision != self.db.revision(kind):
+            raise ValueError("Dados mudaram durante o treino. Modelo não publicado.")
+        with self.lock:
+            registry = self.directory / "registry.json"
+            entries = (
+                json.loads(registry.read_text(encoding="utf-8"))
+                if registry.exists()
+                else {}
+            )
+            entries[kind] = folder
+            atomic_json(registry, entries)
+            self.db.set_summary(kind, meta)
+            self.models[kind] = (model, meta)
+            self.errors.pop(kind, None)
+        progress(f"{kind}: concluído")
+        return meta
+
+    def available(self, kind):
+        with self.lock:
+            return kind in self.models
+
+    def predict(self, kind, features):
+        with self.lock:
+            bundle = self.models.get(kind)
+            if bundle is None:
+                return None, 0.0, 0.0
+            model, meta = bundle
+            if kind == "static":
+                logits = np.log(
+                    np.clip(model.predict_proba(features.reshape(1, -1))[0], 1e-7, 1)
+                )
+            else:
+                import torch
+
+                normalized = (features - np.array(meta["mean"], np.float32)) / np.array(
+                    meta["scale"], np.float32
+                )
+                with torch.no_grad():
+                    logits = model(
+                        torch.tensor(normalized, dtype=torch.float32).unsqueeze(0)
+                    ).numpy()[0]
+            probabilities = softmax(logits / meta["temperature"])
+            best = int(probabilities.argmax())
+            ordered = np.sort(probabilities)
+            margin = float(ordered[-1] - ordered[-2]) if len(ordered) > 1 else 0.0
+            return meta["classes"][best], float(probabilities[best]), margin
