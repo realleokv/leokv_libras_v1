@@ -25,6 +25,12 @@ def test_csrf_origin_and_malformed_json(admin):
     assert admin.post("/api/history/clear", json={}).status_code == 403
     assert (
         admin.post(
+            "/api/history/clear", json={}, headers={"X-CSRF-Token": "inválido"}
+        ).status_code
+        == 403
+    )
+    assert (
+        admin.post(
             "/api/history/clear",
             json={},
             headers={"X-CSRF-Token": admin.csrf, "Origin": "https://untrusted.example"},
@@ -76,6 +82,11 @@ def test_websocket_auth_and_isolation(app, client, jpeg):
     sio = app.extensions["libras_socket"]
     bad = sio.test_client(app, flask_test_client=client, auth={"csrf": "wrong"})
     assert not bad.is_connected()
+    for invalid in ("inválido", None, [], 123):
+        rejected = sio.test_client(
+            app, flask_test_client=client, auth={"csrf": invalid}
+        )
+        assert not rejected.is_connected()
     a = sock(app, client)
     second = app.test_client()
     second.csrf = second.get("/api/session").json["csrf"]

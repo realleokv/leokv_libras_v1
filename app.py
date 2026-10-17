@@ -40,6 +40,14 @@ from stabilizer import TemporalStabilizer, result
 from capture import Capture
 
 
+def csrf_matches(supplied):
+    return (
+        isinstance(supplied, str)
+        and supplied.isascii()
+        and hmac.compare_digest(supplied, session.get("csrf", "!"))
+    )
+
+
 def decode_base64_frame(data_url):
     if not isinstance(data_url, str) or not data_url.startswith(
         "data:image/jpeg;base64,"
@@ -194,9 +202,7 @@ def create_app(test_config=None, extractor_factory=HandFeatureExtractor):
                 *origins,
             ]:
                 return jsonify(error="Origem não permitida."), 403
-            if not hmac.compare_digest(
-                request.headers.get("X-CSRF-Token", ""), session.get("csrf", "!")
-            ):
+            if not csrf_matches(request.headers.get("X-CSRF-Token", "")):
                 return jsonify(error="Sessão expirada. Recarregue a página."), 403
 
     @app.after_request
@@ -414,9 +420,7 @@ def create_app(test_config=None, extractor_factory=HandFeatureExtractor):
 
     @socketio.on("connect")
     def connect(auth):
-        if not isinstance(auth, dict) or not hmac.compare_digest(
-            str(auth.get("csrf", "")), session.get("csrf", "!")
-        ):
+        if not isinstance(auth, dict) or not csrf_matches(auth.get("csrf")):
             return False
         with runtime.clients_lock:
             if len(runtime.clients) >= MAX_SESSIONS:
