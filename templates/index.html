@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LibrasVision AI — Reconhecimento de Libras em Tempo Real</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <div class="brand-logo">LV</div>
+            <div>
+                <h1>LibrasVision <span>AI</span></h1>
+                <p>MediaPipe Hands • Scikit-learn • PyTorch LSTM</p>
+            </div>
+        </div>
+        <nav class="nav-tabs">
+            <button class="tab-btn active" data-tab="tab-live">Reconhecimento ao Vivo</button>
+            <button class="tab-btn" data-tab="tab-train">Treinamento de IA</button>
+            <button class="tab-btn" data-tab="tab-metrics">Precisão & Catálogo Libras</button>
+        </nav>
+        <div class="status-badges">
+            <span id="conn-badge" class="badge badge-offline">Desconectado</span>
+            <span id="fps-badge" class="badge">0 FPS</span>
+        </div>
+    </header>
+
+    <main class="container">
+        <!-- ABA 1: RECONHECIMENTO EM TEMPO REAL -->
+        <section id="tab-live" class="tab-panel active">
+            <div class="live-grid">
+                <!-- Coluna da Câmera -->
+                <div class="card camera-card">
+                    <div class="card-header">
+                        <h2>Câmera & Landmarks 3D (21 Pontos)</h2>
+                        <div class="camera-controls">
+                            <button id="btn-toggle-cam" class="btn btn-primary">Iniciar Câmera</button>
+                            <button id="btn-switch-cam" class="btn btn-outline" title="Alternar câmera frontal/traseira">Inverter Câmera</button>
+                        </div>
+                    </div>
+                    <div class="viewport-wrapper">
+                        <video id="webcam" autoplay playsinline muted></video>
+                        <canvas id="overlay-canvas"></canvas>
+                        <div id="recording-banner" class="recording-banner hidden">
+                            Gravando Amostras: <span id="rec-progress">0/0</span>
+                        </div>
+                    </div>
+                    <div class="telemetry-bar">
+                        <div>Mãos detectadas: <strong id="tel-hands">0</strong></div>
+                        <div>Velocidade: <strong id="tel-velocity">0.000</strong></div>
+                        <div class="threshold-control">
+                            <label for="slider-threshold">Confiança Mínima: <strong id="lbl-threshold">72%</strong></label>
+                            <input type="range" id="slider-threshold" min="40" max="95" value="72">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Coluna de Resultados e Formação de Texto -->
+                <div class="side-column">
+                    <!-- Sinal Identificado -->
+                    <div class="card recognition-hero">
+                        <div class="hero-top">
+                            <span class="hero-tag" id="pred-mode-tag">Aguardando</span>
+                            <span class="hero-conf" id="pred-conf-text">0%</span>
+                        </div>
+                        <div class="hero-sign" id="pred-sign-label">Aguardando câmera...</div>
+                        <div class="confidence-track">
+                            <div id="pred-conf-bar" class="confidence-fill" style="width: 0%;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Formador de Frases e Gramática Libras -->
+                    <div class="card text-builder-card">
+                        <div class="card-header">
+                            <h2>Formação de Texto & Voz</h2>
+                            <span class="sub-hint">Respeita datilologia e glosa de Libras</span>
+                        </div>
+                        <div class="glosa-box">
+                            <label>Glosa Reconhecida (Estrutura Libras):</label>
+                            <div id="glosa-output" class="output-area empty">Nenhum sinal emitido ainda...</div>
+                        </div>
+                        <div class="pt-box">
+                            <label>Texto Formatado (Português):</label>
+                            <textarea id="pt-output" rows="2" placeholder="As letras e sinais reconhecidos formarão frases aqui..."></textarea>
+                        </div>
+                        <div class="builder-actions">
+                            <button id="btn-space" class="btn btn-outline">Espaço</button>
+                            <button id="btn-backspace" class="btn btn-outline">Apagar Último</button>
+                            <button id="btn-clear" class="btn btn-outline">Limpar</button>
+                            <button id="btn-copy" class="btn btn-outline">Copiar</button>
+                            <button id="btn-speak" class="btn btn-accent">Ouvir Voz (PT-BR)</button>
+                        </div>
+                    </div>
+
+                    <!-- Histórico em Tempo Real -->
+                    <div class="card history-card">
+                        <div class="card-header">
+                            <h2>Histórico de Reconhecimento</h2>
+                        </div>
+                        <ul id="history-list" class="history-list"></ul>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ABA 2: ESTÚDIO DE TREINAMENTO DE IA -->
+        <section id="tab-train" class="tab-panel">
+            <div class="train-grid">
+                <div class="card">
+                    <h2>1. Coletar Amostras pela Webcam</h2>
+                    <p class="muted-text">
+                        Selecione um sinal do catálogo (ou cadastre um novo abaixo), mantenha a mão visível na câmera e capture amostras reais.
+                    </p>
+                    <div class="form-group">
+                        <label for="select-train-sign">Sinal Alvo para Coleta:</label>
+                        <select id="select-train-sign"></select>
+                    </div>
+                    <div id="selected-sign-info" class="info-callout"></div>
+                    <div class="form-group">
+                        <label for="input-burst-count">Quantidade de Amostras estáticas por captura:</label>
+                        <input type="number" id="input-burst-count" value="35" min="10" max="150">
+                    </div>
+                    <div class="train-buttons">
+                        <button id="btn-capture-samples" class="btn btn-primary">Capturar Amostras Agora</button>
+                        <button id="btn-train-models" class="btn btn-accent">Treinar Modelos (Scikit-learn & LSTM)</button>
+                    </div>
+                    <div id="train-status-box" class="status-log">Pronto para coleta e treinamento.</div>
+                </div>
+
+                <div class="card">
+                    <h2>2. Cadastrar Novo Sinal de Libras</h2>
+                    <form id="form-new-sign">
+                        <div class="form-group">
+                            <label for="new-sign-label">Letra ou Palavra/Expressão:</label>
+                            <input type="text" id="new-sign-label" placeholder="Ex: Bom dia, Professor, A..." required>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="new-sign-category">Categoria:</label>
+                                <select id="new-sign-category">
+                                    <option value="alfabeto">Alfabeto (A–Z)</option>
+                                    <option value="palavra" selected>Palavra / Expressão</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="new-sign-dynamic">Tipo de Sinal:</label>
+                                <select id="new-sign-dynamic">
+                                    <option value="0">Estático (Scikit-learn RF)</option>
+                                    <option value="1">Com Movimento (PyTorch LSTM - 20 frames)</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="new-sign-desc">Descrição Articulatória Real (Libras):</label>
+                            <textarea id="new-sign-desc" rows="2" placeholder="Descreva a configuração de mão, ponto de articulação e movimento..."></textarea>
+                        </div>
+                        <button type="submit" class="btn btn-outline">Salvar no Catálogo</button>
+                    </form>
+                </div>
+            </div>
+        </section>
+
+        <!-- ABA 3: PRECISÃO REAL E CATÁLOGO DE SINAIS -->
+        <section id="tab-metrics" class="tab-panel">
+            <div class="metrics-summary-row">
+                <div class="card metric-box">
+                    <span>Modelo Estático (Scikit-learn `.pkl`)</span>
+                    <strong id="metric-static-acc">Não treinado</strong>
+                    <small id="metric-static-meta">0 amostras registradas</small>
+                </div>
+                <div class="card metric-box">
+                    <span>Modelo Temporal (PyTorch LSTM `.pt`)</span>
+                    <strong id="metric-dynamic-acc">Não treinado</strong>
+                    <small id="metric-dynamic-meta">0 sequências registradas</small>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2>Tabela de Classes, Amostras Reais e Precisão</h2>
+                    <input type="text" id="filter-signs-input" placeholder="Filtrar letra ou palavra...">
+                </div>
+                <div class="table-responsive">
+                    <table class="signs-table">
+                        <thead>
+                            <tr>
+                                <th>Sinal</th>
+                                <th>Categoria</th>
+                                <th>Modelo / Tipo</th>
+                                <th>Referência Articulatória (Libras)</th>
+                                <th>Amostras</th>
+                                <th>Precisão Real</th>
+                                <th>F1-Score</th>
+                                <th>Ações</th>
+                            </tr>
+                        </thead>
+                        <tbody id="signs-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script src="/static/js/main.js"></script>
+</body>
+</html>
